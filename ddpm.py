@@ -48,13 +48,13 @@ class DDPM(nn.Module):
         ### Implement Algorithm 1 here ###
         batch_size = x.shape[0]
 
-        t = torch.randint(0, self.T, (batch_size,))
+        t = torch.randint(0, self.T, (batch_size,), device=self.alpha.device)
         eps = torch.randn_like(x)
 
         alpha_t = self.alpha_cumprod[t].view(-1, 1)  # shape (batch_size, 1)
         z = torch.sqrt(alpha_t) * x + torch.sqrt(1 - alpha_t) * eps
 
-        neg_elbo = torch.sum((eps - self.network(z, t.view(-1, 1)))**2)
+        neg_elbo = torch.mean((eps - self.network(z, t.view(-1, 1)))**2)
 
         return neg_elbo
 
@@ -77,7 +77,7 @@ class DDPM(nn.Module):
             ### Implement the remaining of Algorithm 2 here ###
             eta = torch.randn_like(x_t)
             x_t = ((x_t - self.beta[t]/torch.sqrt(1 - self.alpha_cumprod[t]) 
-                    * self.network(x_t, torch.full((x_t.shape[0], 1), t))) 
+                    * self.network(x_t, torch.full((x_t.shape[0], 1), t, device=self.alpha.device))) 
                    / torch.sqrt(self.alpha[t]) + torch.sqrt(self.beta[t]) * eta)
 
         return x_t

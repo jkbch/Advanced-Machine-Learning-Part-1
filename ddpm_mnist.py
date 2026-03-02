@@ -48,13 +48,13 @@ class DDPM(nn.Module):
         ### Implement Algorithm 1 here ###
         batch_size = x.shape[0]
 
-        t = torch.randint(0, self.T, (batch_size,))
+        t = torch.randint(0, self.T, (batch_size,), device=self.alpha.device)
         eps = torch.randn_like(x)
 
         alpha_t = self.alpha_cumprod[t].view(-1, 1)  # shape (batch_size, 1)
         z = torch.sqrt(alpha_t) * x + torch.sqrt(1 - alpha_t) * eps
 
-        neg_elbo = torch.sum((eps - self.network(z, t.view(-1, 1)))**2)
+        neg_elbo = torch.mean((eps - self.network(z, t.view(-1, 1)))**2)
 
         return neg_elbo
 
@@ -77,7 +77,7 @@ class DDPM(nn.Module):
             ### Implement the remaining of Algorithm 2 here ###
             eta = torch.randn_like(x_t)
             x_t = ((x_t - self.beta[t]/torch.sqrt(1 - self.alpha_cumprod[t]) 
-                    * self.network(x_t, torch.full((x_t.shape[0], 1), t))) 
+                    * self.network(x_t, torch.full((x_t.shape[0], 1), t, device=self.alpha.device))) 
                    / torch.sqrt(self.alpha[t]) + torch.sqrt(self.beta[t]) * eta)
 
         return x_t
@@ -168,6 +168,7 @@ if __name__ == "__main__":
     from torchvision import datasets, transforms
     from torchvision.utils import save_image
     import ToyData
+    from unet import Unet
 
     # Parse arguments
     import argparse
@@ -189,16 +190,33 @@ if __name__ == "__main__":
     # Generate the data
     n_data = 10000000
     toy = {'tg': ToyData.TwoGaussians, 'cb': ToyData.Chequerboard}[args.data]()
-    transform = lambda x: (x-0.5)*2.0
-    train_loader = torch.utils.data.DataLoader(transform(toy().sample((n_data,))), batch_size=args.batch_size, shuffle=True)
-    test_loader = torch.utils.data.DataLoader(transform(toy().sample((n_data,))), batch_size=args.batch_size, shuffle=True)
+    transform_toy = lambda x: (x-0.5)*2.0
+    train_loader_toy = torch.utils.data.DataLoader(transform_toy(toy().sample((n_data,))), batch_size=args.batch_size, shuffle=True)
+    test_loader_toy = torch.utils.data.DataLoader(transform_toy(toy().sample((n_data,))), batch_size=args.batch_size, shuffle=True)
+
+    transform = transforms.Compose ([transforms.ToTensor(),
+        transforms.Lambda(lambda x: x + torch.rand(x.shape)/255),
+        transforms.Lambda(lambda x: (x - 0.5)*2.0),
+        transforms.Lambda(lambda x: x.flatten())]
+    )
+    train_data = datasets.MNIST('data/',
+        train=True,
+        download=True,
+        transform=transform)
+    test_data = datasets.MNIST('data/',
+        train=False,
+        download=True,
+        transform=transform)
+    train_loader = torch.utils.data.DataLoader(train_data, batch_size=args.batch_size, shuffle=True)
+    test_loader = torch.utils.data.DataLoader(test_data, batch_size=args.batch_size, shuffle=True)
 
     # Get the dimension of the dataset
-    D = next(iter(train_loader)).shape[1]
+    D = next(iter(train_loader))[0].shape[1]
 
     # Define the network
     num_hidden = 64
-    network = FcNetwork(D, num_hidden)
+    #network = FcNetwork(D, num_hidden)
+    network = Unet()
 
     # Set the number of steps in the diffusion process
     T = 1000
