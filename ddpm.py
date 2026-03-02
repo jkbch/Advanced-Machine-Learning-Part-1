@@ -180,25 +180,53 @@ if __name__ == "__main__":
     parser.add_argument('--batch-size', type=int, default=10000, metavar='N', help='batch size for training (default: %(default)s)')
     parser.add_argument('--epochs', type=int, default=1, metavar='N', help='number of epochs to train (default: %(default)s)')
     parser.add_argument('--lr', type=float, default=1e-3, metavar='V', help='learning rate for training (default: %(default)s)')
+    parser.add_argument('--data', type=str, default='tg', choices=['tg', 'cb', 'mnist'], help='dataset to use {tg: two Gaussians, cb: chequerboard} (default: %(default)s)')
+    parser.add_argument('--network', type=str, default='fcn', choices=['fcn', 'unet'], help='network to use {fcn: Fully connected network, unet: Unet network} (default: %(default)s)')
 
     args = parser.parse_args()
     print('# Options')
     for key, value in sorted(vars(args).items()):
         print(key, '=', value)
 
-    # Generate the data
-    n_data = 10000000
-    toy = {'tg': ToyData.TwoGaussians, 'cb': ToyData.Chequerboard}[args.data]()
-    transform = lambda x: (x-0.5)*2.0
-    train_loader = torch.utils.data.DataLoader(transform(toy().sample((n_data,))), batch_size=args.batch_size, shuffle=True)
-    test_loader = torch.utils.data.DataLoader(transform(toy().sample((n_data,))), batch_size=args.batch_size, shuffle=True)
+    if args.data == "tg":
+        # Generate the data
+        n_data = 10000000
+        toy = {'tg': ToyData.TwoGaussians, 'cb': ToyData.Chequerboard}[args.data]()
+        transform = lambda x: (x-0.5)*2.0
+        train_loader = torch.utils.data.DataLoader(transform(toy().sample((n_data,))), batch_size=args.batch_size, shuffle=True)
+        test_loader = torch.utils.data.DataLoader(transform(toy().sample((n_data,))), batch_size=args.batch_size, shuffle=True)
 
-    # Get the dimension of the dataset
-    D = next(iter(train_loader)).shape[1]
+        # Get the dimension of the dataset
+        D = next(iter(train_loader)).shape[1]
+    elif args.data == "mnist":
+        # Get the data
+        transform = transforms.Compose ([transforms.ToTensor(),
+            transforms.Lambda(lambda x: x + torch.rand(x.shape)/255),
+            transforms.Lambda(lambda x: (x - 0.5)*2.0),
+            transforms.Lambda(lambda x: x.flatten())]
+        )
+        train_data = datasets.MNIST('data/',
+            train=True,
+            download=True,
+            transform=transform)
+        test_data = datasets.MNIST('data/',
+            train=False,
+            download=True,
+            transform=transform)
+        train_loader = torch.utils.data.DataLoader(train_data, batch_size=args.batch_size, shuffle=True)
+        test_loader = torch.utils.data.DataLoader(test_data, batch_size=args.batch_size, shuffle=True)
+    
+        # Get the dimension of the dataset
+        D = next(iter(train_loader))[0].shape[1]
+
 
     # Define the network
-    num_hidden = 64
-    network = FcNetwork(D, num_hidden)
+    if args.data == "network":
+        num_hidden = 64
+        network = FcNetwork(D, num_hidden)
+    elif args.network == "unet":
+        from unet import Unet
+        network = Unet()
 
     # Set the number of steps in the diffusion process
     T = 1000
@@ -218,30 +246,52 @@ if __name__ == "__main__":
         torch.save(model.state_dict(), args.model)
 
     elif args.mode == 'sample':
-        import matplotlib.pyplot as plt
-        import numpy as np
+        if args.data == "tg":
+            import matplotlib.pyplot as plt
+            import numpy as np
 
-        # Load the model
-        model.load_state_dict(torch.load(args.model, map_location=torch.device(args.device)))
+            # Load the model
+            model.load_state_dict(torch.load(args.model, map_location=torch.device(args.device)))
 
-        # Generate samples
-        model.eval()
-        with torch.no_grad():
-            samples = (model.sample((10000,D))).cpu() 
+            # Generate samples
+            model.eval()
+            with torch.no_grad():
+                samples = (model.sample((10000,D))).cpu() 
 
-        # Transform the samples back to the original space
-        samples = samples /2 + 0.5
+            # Transform the samples back to the original space
+            samples = samples /2 + 0.5
 
-        # Plot the density of the toy data and the model samples
-        coordinates = [[[x,y] for x in np.linspace(*toy.xlim, 1000)] for y in np.linspace(*toy.ylim, 1000)]
-        prob = torch.exp(toy().log_prob(torch.tensor(coordinates)))
+            # Plot the density of the toy data and the model samples
+            coordinates = [[[x,y] for x in np.linspace(*toy.xlim, 1000)] for y in np.linspace(*toy.ylim, 1000)]
+            prob = torch.exp(toy().log_prob(torch.tensor(coordinates)))
 
-        fig, ax = plt.subplots(1, 1, figsize=(7, 5))
-        im = ax.imshow(prob, extent=[toy.xlim[0], toy.xlim[1], toy.ylim[0], toy.ylim[1]], origin='lower', cmap='YlOrRd')
-        ax.scatter(samples[:, 0], samples[:, 1], s=1, c='black', alpha=0.5)
-        ax.set_xlim(toy.xlim)
-        ax.set_ylim(toy.ylim)
-        ax.set_aspect('equal')
-        fig.colorbar(im)
-        plt.savefig(args.samples)
-        plt.close()
+            fig, ax = plt.subplots(1, 1, figsize=(7, 5))
+            im = ax.imshow(prob, extent=[toy.xlim[0], toy.xlim[1], toy.ylim[0], toy.ylim[1]], origin='lower', cmap='YlOrRd')
+            ax.scatter(samples[:, 0], samples[:, 1], s=1, c='black', alpha=0.5)
+            ax.set_xlim(toy.xlim)
+            ax.set_ylim(toy.ylim)
+            ax.set_aspect('equal')
+            fig.colorbar(im)
+            plt.savefig(args.samples)
+            plt.close()
+
+        elif args.data == "mnist":
+            from torchvision.utils import save_image
+
+            # Load the model
+            model.load_state_dict(torch.load(args.model, map_location=torch.device(args.device)))
+
+            # Generate samples in flattened space
+            model.eval()
+            with torch.no_grad():
+                samples = model.sample((100, D)).cpu()
+
+            # Map from [-1,1] back to [0,1]
+            samples = samples / 2 + 0.5
+            samples = torch.clamp(samples, 0.0, 1.0)
+
+            # Reshape to MNIST image shape
+            samples = samples.view(-1, 1, 28, 28)
+
+            # Save grid of generated digits
+            save_image(samples, args.samples, nrow=10)
