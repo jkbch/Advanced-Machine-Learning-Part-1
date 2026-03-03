@@ -180,15 +180,23 @@ if __name__ == "__main__":
     parser.add_argument('--batch-size', type=int, default=10000, metavar='N', help='batch size for training (default: %(default)s)')
     parser.add_argument('--epochs', type=int, default=1, metavar='N', help='number of epochs to train (default: %(default)s)')
     parser.add_argument('--lr', type=float, default=1e-3, metavar='V', help='learning rate for training (default: %(default)s)')
-    parser.add_argument('--data', type=str, default='tg', choices=['tg', 'cb', 'mnist'], help='dataset to use {tg: two Gaussians, cb: chequerboard} (default: %(default)s)')
     parser.add_argument('--network', type=str, default='fcn', choices=['fcn', 'unet'], help='network to use {fcn: Fully connected network, unet: Unet network} (default: %(default)s)')
+    
+    parser.add_argument('--vae_model', type=str, default=None, help='vae model to use for latent space (default: %(default)s)')
+    parser.add_argument('--latent-dim', type=int, default=32, metavar='N', help='dimension of latent variable (default: %(default)s)')
+    parser.add_argument('--prior', type=str, default='gaussian',choices=['gaussian', 'mog', 'flow', 'ddpm'], help='prior type (default: %(default)s)')
+    parser.add_argument('--mask', type=str, default='random', choices=['first_half', 'random', 'chequerboard'], help='masking strategy for flow prior (default: %(default)s)')
+    parser.add_argument('--num-components', type=int, default=10, help='number of mixture components for MoG prior (default: %(default)s)')
+    parser.add_argument('--decoder', type=str, default='bernoulli',choices=['bernoulli', 'gaussian'], help='decoder type (default: %(default)s)')
+    parser.add_argument('--beta', type=float, default=1.0, help='beta parameter for beta-VAE (default: %(default)s)')
+
 
     args = parser.parse_args()
     print('# Options')
     for key, value in sorted(vars(args).items()):
         print(key, '=', value)
 
-    if args.data == "tg":
+    if args.data in ['tg', 'cb']:
         # Generate the data
         n_data = 10000000
         toy = {'tg': ToyData.TwoGaussians, 'cb': ToyData.Chequerboard}[args.data]()
@@ -219,9 +227,29 @@ if __name__ == "__main__":
         # Get the dimension of the dataset
         D = next(iter(train_loader))[0].shape[1]
 
+    if args.vae_model is not None:
+        from vae import init_vae_model
+
+        vae_model = init_vae_model(args)
+        vae_model.load_state_dict(torch.load(args.vae_model, map_location=torch.device(args.device)))
+        vae_model.eval()
+
+        latent_vectors = []
+        with torch.no_grad():
+            for x, _ in train_loader:
+                x = x.to(args.device)
+                q = vae_model.encoder(x)
+                z = q.rsample()  # sample from approximate posterior
+                latent_vectors.append(z.cpu())
+        latent_vectors = torch.cat(latent_vectors, dim=0)
+        train_loader = torch.utils.data.DataLoader(latent_vectors, batch_size=args.batch_size, shuffle=True)
+
+        D = args.latent_dim
+    
 
     # Define the network
-    if args.data == "network":
+    print(args.network)
+    if args.network == "fcn":
         num_hidden = 64
         network = FcNetwork(D, num_hidden)
     elif args.network == "unet":
@@ -246,7 +274,7 @@ if __name__ == "__main__":
         torch.save(model.state_dict(), args.model)
 
     elif args.mode == 'sample':
-        if args.data == "tg":
+        if args.data in ['tg', 'cb']:
             import matplotlib.pyplot as plt
             import numpy as np
 
@@ -277,21 +305,41 @@ if __name__ == "__main__":
 
         elif args.data == "mnist":
             from torchvision.utils import save_image
+            
+            if args.vae_model is None:
+                # Load the model
+                model.load_state_dict(torch.load(args.model, map_location=torch.device(args.device)))
 
-            # Load the model
-            model.load_state_dict(torch.load(args.model, map_location=torch.device(args.device)))
+                # Generate samples in flattened space
+                model.eval()
+                with torch.no_grad():
+                    samples = model.sample((100, D)).cpu()
 
-            # Generate samples in flattened space
-            model.eval()
-            with torch.no_grad():
-                samples = model.sample((100, D)).cpu()
+                # Map from [-1,1] back to [0,1]
+                samples = samples / 2 + 0.5
+                samples = torch.clamp(samples, 0.0, 1.0)
 
-            # Map from [-1,1] back to [0,1]
-            samples = samples / 2 + 0.5
-            samples = torch.clamp(samples, 0.0, 1.0)
+                # Reshape to MNIST image shape
+                samples = samples.view(-1, 1, 28, 28)
 
-            # Reshape to MNIST image shape
-            samples = samples.view(-1, 1, 28, 28)
+                # Save grid of generated digits
+                save_image(samples, args.samples, nrow=10)
 
-            # Save grid of generated digits
-            save_image(samples, args.samples, nrow=10)
+            else:
+                # Load the DDPM model trained on latent space
+                model.load_state_dict(torch.load(args.model, map_location=torch.device(args.device)))
+                model.eval()
+
+                # Sample latent vectors
+                with torch.no_grad():
+                    z_samples = model.sample((100, args.latent_dim)).to(args.device)
+
+                # Decode latent vectors to images
+                with torch.no_grad():
+                    recon = vae_model.decoder(z_samples).sample().cpu()
+
+                # If decoder outputs [0,1] directly, good. Otherwise, map appropriately
+                recon = torch.clamp(recon, 0.0, 1.0).view(-1, 1, 28, 28)
+
+                # Save generated images
+                save_image(recon, args.samples, nrow=10)

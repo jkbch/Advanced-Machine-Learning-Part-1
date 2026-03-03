@@ -12,6 +12,9 @@ from torch.nn import functional as F
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
+from scipy.stats import gaussian_kde
+from sklearn.manifold import TSNE
+import numpy as np
 
 
 class GaussianPrior(nn.Module):
@@ -141,7 +144,7 @@ class VAE(nn.Module):
     """
     Define a Variational Autoencoder (VAE) model.
     """
-    def __init__(self, prior, decoder, encoder):
+    def __init__(self, prior, decoder, encoder, beta):
         """
         Parameters:
         prior: [torch.nn.Module] 
@@ -156,8 +159,9 @@ class VAE(nn.Module):
         self.prior = prior
         self.decoder = decoder
         self.encoder = encoder
+        self.beta = beta
 
-    def elbo(self, x, prior, beta):
+    def elbo(self, x):
         """
         Compute the ELBO for the given batch of data.
 
@@ -170,16 +174,10 @@ class VAE(nn.Module):
         q = self.encoder(x)
         z = q.rsample()
         log_px_z = self.decoder(z).log_prob(x)
-
-        if prior == "gaussian":
-            kl = td.kl_divergence(q, self.prior())
-            elbo = torch.mean(log_px_z - beta * kl, dim=0)
-
-        else:  # covers MoG and any other prior
-            log_qz_x = q.log_prob(z)
-            log_pz = self.prior().log_prob(z)
-            kl = log_qz_x - log_pz
-            elbo = torch.mean(log_px_z - beta * kl, dim=0)
+        log_qz_x = q.log_prob(z)
+        log_pz = self.prior().log_prob(z)
+        kl = log_qz_x - log_pz
+        elbo = torch.mean(log_px_z - self.beta * kl, dim=0)
 
         return elbo
 
@@ -194,7 +192,7 @@ class VAE(nn.Module):
         z = self.prior().sample(torch.Size([n_samples]))
         return self.decoder(z).sample()
     
-    def forward(self, x, prior, beta):
+    def forward(self, x):
         """
         Compute the negative ELBO for the given batch of data.
 
@@ -202,10 +200,10 @@ class VAE(nn.Module):
         x: [torch.Tensor] 
            A tensor of dimension `(batch_size, feature_dim1, feature_dim2)`
         """
-        return -self.elbo(x, prior, beta)
+        return -self.elbo(x)
 
 
-def train(model, optimizer, data_loader, epochs, device, prior, beta):
+def train(model, optimizer, data_loader, epochs, device):
     """
     Train a VAE model.
 
@@ -231,8 +229,9 @@ def train(model, optimizer, data_loader, epochs, device, prior, beta):
         for x in data_iter:
             if isinstance(x, (list, tuple)):
                 x = x[0]
+            x = x.to(device)
             optimizer.zero_grad()
-            loss = model(x, prior, beta)
+            loss = model(x)
             loss.backward()
             optimizer.step()
 
@@ -241,121 +240,161 @@ def train(model, optimizer, data_loader, epochs, device, prior, beta):
             progress_bar.update()
 
 
-def evaluate_elbo(model, data_loader, device, prior, beta):
+def evaluate_elbo(model, data_loader, device):
     model.eval()
     total_elbo = 0.0
     n = 0
 
     with torch.no_grad():
-        for x, _ in data_loader:
+        data_iter = iter(data_loader)
+        for x in data_iter:
+            if isinstance(x, (list, tuple)):
+                x = x[0]
             x = x.to(device)
-            elbo = model.elbo(x, prior, beta)
+            elbo = model.elbo(x)
             total_elbo += elbo.item() * x.size(0)
             n += x.size(0)
 
     return total_elbo / n
 
 
-def plot_aggregate_posterior(model, data_loader, device, latent_dim):
+def plot_prior_and_posterior(
+    model,
+    data_loader,
+    device,
+    out_file="prior_posterior.png",
+    use_pca=False,
+    n_prior_samples=10000,
+):
     model.eval()
 
-    zs = []
-    ys = []
+    # --------- Sample Prior ---------
+    if isinstance(model.prior, FlowPrior):
+        prior_samples = model.prior.sample(n_prior_samples)
+    else:
+        prior_samples = model.prior().sample(sample_shape=(n_prior_samples,))
 
-    with torch.no_grad():
-        for x, y in data_loader:
-            x = x.to(device)
-            q = model.encoder(x)
-            z = q.rsample()
-            zs.append(z.cpu())
-            ys.append(y)
+    # --------- Collect Posterior ---------
+    posterior_samples = []
+    labels = []
 
-    zs = torch.cat(zs, dim=0).numpy()
-    ys = torch.cat(ys, dim=0).numpy()
+    for x, y in data_loader:
+        x = x.to(device)
+        y = y.to(device)
 
-    if latent_dim > 2:
-        pca = PCA(n_components=2)
-        zs = pca.fit_transform(zs)
+        dists = model.encoder(x)
+        z = dists.rsample()
 
-    plt.figure(figsize=(8,6))
-    scatter = plt.scatter(zs[:,0], zs[:,1], c=ys, cmap="tab10", s=5)
-    plt.colorbar(scatter)
-    plt.title("Aggregate Posterior Samples")
+        posterior_samples.append(z)
+        labels.append(y)
+
+    posterior_samples = torch.cat(posterior_samples, dim=0)
+    labels = torch.cat(labels, dim=0).cpu().numpy()
+
+    print(f"{prior_samples.size()=}")
+    print(f"{posterior_samples.size()=}")
+
+    # --------- Combine for joint embedding ---------
+    all_embeddings = torch.cat([prior_samples, posterior_samples], dim=0)
+    all_embeddings_np = all_embeddings.cpu().detach().numpy()
+
+    # --------- Dimensionality Reduction ---------
+    if use_pca:
+        reducer = PCA(n_components=2)
+        embeddings_2d = reducer.fit_transform(all_embeddings_np)
+    else:
+        reducer = TSNE(
+            n_components=2,
+            perplexity=30,
+            learning_rate="auto",
+            init="pca",
+            random_state=42,
+        )
+        embeddings_2d = reducer.fit_transform(all_embeddings_np)
+
+    # --------- Split back ---------
+    prior_2d = embeddings_2d[:n_prior_samples]
+    posterior_2d = embeddings_2d[n_prior_samples:]
+
+    plt.figure(figsize=(10, 8))
+
+    # ---------- PRIOR AS FILLED DENSITY ----------
+    # Estimate density
+    kde = gaussian_kde(prior_2d.T)
+
+    # Create grid
+    xmin, ymin = prior_2d.min(axis=0) - 1
+    xmax, ymax = prior_2d.max(axis=0) + 1
+    xx, yy = np.mgrid[xmin:xmax:200j, ymin:ymax:200j]
+
+    grid_coords = np.vstack([xx.ravel(), yy.ravel()])
+    density = kde(grid_coords).reshape(xx.shape)
+
+    # Filled contour (solid color with opacity)
+
+
+    # Add dummy handle for legend
+    plt.scatter([], [], color="gray", alpha=0.6, label="Prior")
+
+    # ---------- POSTERIOR POINTS ----------
+    scatter = plt.scatter(
+        posterior_2d[:, 0],
+        posterior_2d[:, 1],
+        c=labels,
+        cmap="tab10",
+        alpha=0.7,
+    )
+    plt.contour(
+        xx,
+        yy,
+        density,
+        levels=30#,
+        #cmap="Greys",
+        #alpha=0.75,
+    )
+
+    cbar = plt.colorbar(scatter)
+    cbar.set_label("Digit Label")
+
+    plt.xlabel("Dim 1")
+    plt.ylabel("Dim 2")
+    plt.title("VAE Latent Space: Prior vs Aggregate Posterior")
+    plt.legend()
     plt.tight_layout()
+    plt.savefig(out_file, dpi=200)
     plt.close()
 
 
-if __name__ == "__main__":
-    from torchvision import datasets, transforms
-    from torchvision.utils import save_image, make_grid
-    import glob
-
-    # Parse arguments
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('mode', type=str, default='train', choices=['train', 'sample'], help='what to do when running the script (default: %(default)s)')
-    parser.add_argument('--model', type=str, default='model.pt', help='file to save model to or load model from (default: %(default)s)')
-    parser.add_argument('--samples', type=str, default='samples.png', help='file to save samples in (default: %(default)s)')
-    parser.add_argument('--device', type=str, default='cpu', choices=['cpu', 'cuda', 'mps'], help='torch device (default: %(default)s)')
-    parser.add_argument('--batch-size', type=int, default=32, metavar='N', help='batch size for training (default: %(default)s)')
-    parser.add_argument('--epochs', type=int, default=10, metavar='N', help='number of epochs to train (default: %(default)s)')
-    parser.add_argument('--latent-dim', type=int, default=32, metavar='N', help='dimension of latent variable (default: %(default)s)')
-    parser.add_argument('--prior', type=str, default='gaussian',choices=['gaussian', 'mog', 'flow', 'ddpm'], help='prior type (default: %(default)s)')
-    parser.add_argument('--num-components', type=int, default=10, help='number of mixture components for MoG prior (default: %(default)s)')
-    parser.add_argument('--decoder', type=str, default='bernoulli',choices=['bernoulli', 'gaussian'], help='decoder type (default: %(default)s)')
-    parser.add_argument('--beta', type=float, default=1.0, help='beta parameter for beta-VAE (default: %(default)s)')
-    parser.add_argument('--mask', type=str, default='random', choices=['first_half', 'random', 'chequerboard'], help='masking strategy for flow prior (default: %(default)s)')
-
-    args = parser.parse_args()
-    print('# Options')
-    for key, value in sorted(vars(args).items()):
-        print(key, '=', value)
-
-    device = args.device
-
-    if args.decoder == 'bernoulli':
-            # Load MNIST as binarized at 'thresshold' and create data loaders
-            thresshold = 0.5
-            mnist_train_loader = torch.utils.data.DataLoader(
-                datasets.MNIST('data/', 
-                train=True, 
-                download=True,
-                transform=transforms.Compose([
-                    transforms.ToTensor(), 
-                    transforms.Lambda(lambda x: (thresshold < x).float().squeeze())
-                    ])),
-                batch_size=args.batch_size, shuffle=True)
-            mnist_test_loader = torch.utils.data.DataLoader(
-                datasets.MNIST('data/', 
-                    train=False, 
-                    download=True,
-                    transform=transforms.Compose([
-                        transforms.ToTensor(), 
-                        transforms.Lambda(lambda x: (thresshold < x).float().squeeze())
-                    ])),
-                batch_size=args.batch_size, shuffle=True)
+def plot_prior_vs_posterior(model, data_loader, device, latent_dim, file):
+    # Aggregate posterior
+    zs_post = []
+    with torch.no_grad():
+        for x, _ in data_loader:
+            x = x.to(device)
+            z = model.encoder(x).rsample()
+            zs_post.append(z.cpu())
+    zs_post = torch.cat(zs_post, dim=0).numpy()
     
-    elif args.decoder == 'gaussian':
-        # Load MNIST and create data loaders
-        mnist_train_loader = torch.utils.data.DataLoader(
-            datasets.MNIST('data/', 
-                train=True, 
-                download=True,
-                transform=transforms.Compose([
-                    transforms.ToTensor(), 
-                    transforms.Lambda(lambda x: x.squeeze())
-                    ])),
-            batch_size=args.batch_size, shuffle=True)
-        mnist_test_loader = torch.utils.data.DataLoader(
-            datasets.MNIST('data/', 
-                train=False, 
-                download=True,
-                transform=transforms.Compose([
-                    transforms.ToTensor(), 
-                    transforms.Lambda(lambda x: x.squeeze())
-                    ])),
-            batch_size=args.batch_size, shuffle=True)
+    # Sample prior
+    zs_prior = model.prior().sample(torch.Size([len(zs_post)])).cpu().numpy()
+    
+    # Reduce to 2D if needed
+    if latent_dim > 2:
+        pca = PCA(n_components=2)
+        zs_post = pca.fit_transform(zs_post)
+        zs_prior = pca.transform(zs_prior)
+    
+    plt.figure(figsize=(10,5))
+    plt.scatter(zs_prior[:,0], zs_prior[:,1], alpha=0.3, label='Prior', color='red')
+    plt.scatter(zs_post[:,0], zs_post[:,1], alpha=0.5, label='Aggregate Posterior', color='blue')
+    plt.legend()
+    plt.title('Prior vs Aggregate Posterior')
+    plt.tight_layout()
+    plt.savefig(file)
+    plt.show()
 
+
+def init_vae_model(args):
     # Define prior distribution
     M = args.latent_dim
     
@@ -398,9 +437,6 @@ if __name__ == "__main__":
         flow_model = Flow(base, transformations).to(args.device)
         prior = FlowPrior(flow_model)
 
-    elif args.prior == 'ddpm':
-        ...
-
     # Define encoder and decoder networks
     encoder_net = nn.Sequential(
         nn.Flatten(),
@@ -421,9 +457,89 @@ if __name__ == "__main__":
     )
 
     # Define VAE model
-    decoder = BernoulliDecoder(decoder_net)
+    if args.decoder == 'bernoulli':
+        decoder = BernoulliDecoder(decoder_net)
+    elif args.decoder == 'gaussian':
+        decoder = GaussianDecoder(decoder_net)
     encoder = GaussianEncoder(encoder_net)
-    model = VAE(prior, decoder, encoder).to(device)
+    model = VAE(prior, decoder, encoder, args.beta).to(args.device)
+
+    return model
+
+
+if __name__ == "__main__":
+    from torchvision import datasets, transforms
+    from torchvision.utils import save_image, make_grid
+    import glob
+
+    # Parse arguments
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('mode', type=str, default='train', choices=['train', 'sample'], help='what to do when running the script (default: %(default)s)')
+    parser.add_argument('--model', type=str, default='model.pt', help='file to save model to or load model from (default: %(default)s)')
+    parser.add_argument('--samples', type=str, default='samples.png', help='file to save samples in (default: %(default)s)')
+    parser.add_argument('--posterior', type=str, default='posterior.png', help='file to save posterior in (default: %(default)s)')
+    parser.add_argument('--device', type=str, default='cpu', choices=['cpu', 'cuda', 'mps'], help='torch device (default: %(default)s)')
+    parser.add_argument('--batch-size', type=int, default=32, metavar='N', help='batch size for training (default: %(default)s)')
+    parser.add_argument('--epochs', type=int, default=10, metavar='N', help='number of epochs to train (default: %(default)s)')
+    parser.add_argument('--latent-dim', type=int, default=32, metavar='N', help='dimension of latent variable (default: %(default)s)')
+    parser.add_argument('--prior', type=str, default='gaussian',choices=['gaussian', 'mog', 'flow', 'ddpm'], help='prior type (default: %(default)s)')
+    parser.add_argument('--mask', type=str, default='random', choices=['first_half', 'random', 'chequerboard'], help='masking strategy for flow prior (default: %(default)s)')
+    parser.add_argument('--num-components', type=int, default=10, help='number of mixture components for MoG prior (default: %(default)s)')
+    parser.add_argument('--decoder', type=str, default='bernoulli',choices=['bernoulli', 'gaussian'], help='decoder type (default: %(default)s)')
+    parser.add_argument('--beta', type=float, default=1.0, help='beta parameter for beta-VAE (default: %(default)s)')
+
+    args = parser.parse_args()
+    print('# Options')
+    for key, value in sorted(vars(args).items()):
+        print(key, '=', value)
+
+    device = args.device
+
+    if args.decoder == 'bernoulli':
+        # Load MNIST as binarized at 'thresshold' and create data loaders
+        thresshold = 0.5
+        mnist_train_loader = torch.utils.data.DataLoader(
+            datasets.MNIST('data/', 
+            train=True, 
+            download=True,
+            transform=transforms.Compose([
+                transforms.ToTensor(), 
+                transforms.Lambda(lambda x: (thresshold < x).float().squeeze())
+                ])),
+            batch_size=args.batch_size, shuffle=True)
+        mnist_test_loader = torch.utils.data.DataLoader(
+            datasets.MNIST('data/', 
+                train=False, 
+                download=True,
+                transform=transforms.Compose([
+                    transforms.ToTensor(), 
+                    transforms.Lambda(lambda x: (thresshold < x).float().squeeze())
+                ])),
+            batch_size=args.batch_size, shuffle=True)
+    
+    elif args.decoder == 'gaussian':
+        # Load MNIST and create data loaders
+        mnist_train_loader = torch.utils.data.DataLoader(
+            datasets.MNIST('data/', 
+                train=True, 
+                download=True,
+                transform=transforms.Compose([
+                    transforms.ToTensor(), 
+                    transforms.Lambda(lambda x: x.squeeze())
+                    ])),
+            batch_size=args.batch_size, shuffle=True)
+        mnist_test_loader = torch.utils.data.DataLoader(
+            datasets.MNIST('data/', 
+                train=False, 
+                download=True,
+                transform=transforms.Compose([
+                    transforms.ToTensor(), 
+                    transforms.Lambda(lambda x: x.squeeze())
+                    ])),
+            batch_size=args.batch_size, shuffle=True)
+
+    model = init_vae_model(args)
 
     # Choose mode to run
     if args.mode == 'train':
@@ -431,15 +547,16 @@ if __name__ == "__main__":
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
         # Train model
-        train(model, optimizer, mnist_train_loader, args.epochs, args.device, args.prior, args.beta)
+        train(model, optimizer, mnist_train_loader, args.epochs, args.device)
 
         # Save model
         torch.save(model.state_dict(), args.model)
 
-        test_elbo = evaluate_elbo(model, mnist_test_loader, device, args.prior, args.beta)
+        test_elbo = evaluate_elbo(model, mnist_test_loader, device)
         print("Test ELBO:", test_elbo)
 
-        plot_aggregate_posterior(model, mnist_test_loader, device, M, args.posterior)
+        #plot_prior_vs_posterior(model, mnist_test_loader, device, args.latent_dim, args.posterior)
+        plot_prior_and_posterior(model, mnist_test_loader, device, out_file=args.posterior)
 
     elif args.mode == 'sample':
         model.load_state_dict(torch.load(args.model, map_location=torch.device(args.device)))
