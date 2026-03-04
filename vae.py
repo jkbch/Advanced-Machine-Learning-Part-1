@@ -15,6 +15,7 @@ from sklearn.decomposition import PCA
 from scipy.stats import gaussian_kde
 from sklearn.manifold import TSNE
 import numpy as np
+import time
 
 
 class GaussianPrior(nn.Module):
@@ -98,8 +99,10 @@ class GaussianEncoder(nn.Module):
         x: [torch.Tensor] 
            A tensor of dimension `(batch_size, feature_dim1, feature_dim2)`
         """
-        mean, std = torch.chunk(self.encoder_net(x), 2, dim=-1)
-        return td.Independent(td.Normal(loc=mean, scale=torch.exp(std)), 1)
+        mean, log_var = torch.chunk(self.encoder_net(x), 2, dim=-1)
+        log_var = torch.clamp(log_var, min=-20.0, max=20.0)   # prevent underflow/overflow
+        std = torch.exp(0.5 * log_var)
+        return td.Independent(td.Normal(loc=mean, scale=std), 1)
 
 
 class BernoulliDecoder(nn.Module):
@@ -133,10 +136,11 @@ class GaussianDecoder(nn.Module):
         super().__init__()
         self.decoder_net = decoder_net
         self.log_std = nn.Parameter(torch.zeros(28,28))
+        #self.log_std = nn.Parameter(torch.tensor(0.0))
 
     def forward(self, z):
         mean = self.decoder_net(z)
-        std = torch.exp(self.log_std).expand_as(mean)
+        std = torch.exp(self.log_std).clamp(min=1e-6).expand_as(mean)
         return td.Independent(td.Normal(loc=mean, scale=std), 2)
 
 
@@ -161,6 +165,9 @@ class VAE(nn.Module):
         self.encoder = encoder
         self.beta = beta
 
+        self.step_count = 0
+        self.warm_up = 20000
+
     def elbo(self, x):
         """
         Compute the ELBO for the given batch of data.
@@ -177,7 +184,8 @@ class VAE(nn.Module):
         log_qz_x = q.log_prob(z)
         log_pz = self.prior().log_prob(z)
         kl = log_qz_x - log_pz
-        elbo = torch.mean(log_px_z - self.beta * kl, dim=0)
+        beta = self.beta * min(1, self.step_count / self.warm_up)
+        elbo = torch.mean(log_px_z - beta * kl, dim=0)
 
         return elbo
 
@@ -234,6 +242,7 @@ def train(model, optimizer, data_loader, epochs, device):
             loss = model(x)
             loss.backward()
             optimizer.step()
+            model.step_count += 1
 
             # Update progress bar
             progress_bar.set_postfix(loss=f"⠀{loss.item():12.4f}", epoch=f"{epoch+1}/{epochs}")
@@ -242,6 +251,7 @@ def train(model, optimizer, data_loader, epochs, device):
 
 def evaluate_elbo(model, data_loader, device):
     model.eval()
+    model.step_count = model.warm_up
     total_elbo = 0.0
     n = 0
 
@@ -478,6 +488,7 @@ if __name__ == "__main__":
     parser.add_argument('mode', type=str, default='train', choices=['train', 'sample'], help='what to do when running the script (default: %(default)s)')
     parser.add_argument('--model', type=str, default='model.pt', help='file to save model to or load model from (default: %(default)s)')
     parser.add_argument('--samples', type=str, default='samples.png', help='file to save samples in (default: %(default)s)')
+    parser.add_argument('--samples-data', type=str, default='samples.pt', help='file to save samples data in (default: %(default)s)')
     parser.add_argument('--posterior', type=str, default='posterior.png', help='file to save posterior in (default: %(default)s)')
     parser.add_argument('--device', type=str, default='cpu', choices=['cpu', 'cuda', 'mps'], help='torch device (default: %(default)s)')
     parser.add_argument('--batch-size', type=int, default=32, metavar='N', help='batch size for training (default: %(default)s)')
@@ -560,10 +571,35 @@ if __name__ == "__main__":
 
     elif args.mode == 'sample':
         model.load_state_dict(torch.load(args.model, map_location=torch.device(args.device)))
+        model.eval()
+
+        N = 10000
+
+        # Start timing
+        start_time = time.time()
+
+        # If using CUDA, synchronize first
+        if args.device == 'cuda':
+            torch.cuda.synchronize()
 
         # Generate samples
-        model.eval()
         with torch.no_grad():
-            samples = (model.sample(64)).cpu() 
-            save_image(samples.view(64, 1, 28, 28), args.samples)
+            samples = (model.sample(64)).cpu()
+
+        samples = samples.view(64, 1, 28, 28)
+
+        # If decoder outputs [0,1] directly, good. Otherwise, map appropriately
+        samples = torch.clamp(samples, 0.0, 1.0).view(-1, 1, 28, 28)
+
+        if args.device == 'cuda':
+            torch.cuda.synchronize()
+
+        # End timing
+        end_time = time.time()
+
+        print(f"Sampling {N} images took {end_time - start_time:.4f} seconds")
+
+        # Save grid of generated digits
+        torch.save(samples, args.samples_data)
+        save_image(samples[:100], args.samples, nrow=10)
 

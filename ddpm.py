@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.distributions as td
 import torch.nn.functional as F
 from tqdm import tqdm
+import time
 
 
 class DDPM(nn.Module):
@@ -176,13 +177,14 @@ if __name__ == "__main__":
     parser.add_argument('--data', type=str, default='tg', choices=['tg', 'cb', 'mnist'], help='dataset to use {tg: two Gaussians, cb: chequerboard} (default: %(default)s)')
     parser.add_argument('--model', type=str, default='model.pt', help='file to save model to or load model from (default: %(default)s)')
     parser.add_argument('--samples', type=str, default='samples.png', help='file to save samples in (default: %(default)s)')
+    parser.add_argument('--samples-data', type=str, default='samples.pt', help='file to save samples data in (default: %(default)s)')
     parser.add_argument('--device', type=str, default='cpu', choices=['cpu', 'cuda', 'mps'], help='torch device (default: %(default)s)')
     parser.add_argument('--batch-size', type=int, default=10000, metavar='N', help='batch size for training (default: %(default)s)')
     parser.add_argument('--epochs', type=int, default=1, metavar='N', help='number of epochs to train (default: %(default)s)')
     parser.add_argument('--lr', type=float, default=1e-3, metavar='V', help='learning rate for training (default: %(default)s)')
     parser.add_argument('--network', type=str, default='fcn', choices=['fcn', 'unet'], help='network to use {fcn: Fully connected network, unet: Unet network} (default: %(default)s)')
     
-    parser.add_argument('--vae_model', type=str, default=None, help='vae model to use for latent space (default: %(default)s)')
+    parser.add_argument('--vae-model', type=str, default=None, help='vae model to use for latent space (default: %(default)s)')
     parser.add_argument('--latent-dim', type=int, default=32, metavar='N', help='dimension of latent variable (default: %(default)s)')
     parser.add_argument('--prior', type=str, default='gaussian',choices=['gaussian', 'mog', 'flow', 'ddpm'], help='prior type (default: %(default)s)')
     parser.add_argument('--mask', type=str, default='random', choices=['first_half', 'random', 'chequerboard'], help='masking strategy for flow prior (default: %(default)s)')
@@ -207,12 +209,19 @@ if __name__ == "__main__":
         # Get the dimension of the dataset
         D = next(iter(train_loader)).shape[1]
     elif args.data == "mnist":
-        # Get the data
-        transform = transforms.Compose ([transforms.ToTensor(),
-            transforms.Lambda(lambda x: x + torch.rand(x.shape)/255),
-            transforms.Lambda(lambda x: (x - 0.5)*2.0),
-            transforms.Lambda(lambda x: x.flatten())]
-        )
+        if args.vae_model is None:
+            # Get the data
+            transform = transforms.Compose ([transforms.ToTensor(),
+                transforms.Lambda(lambda x: x + torch.rand(x.shape)/255),
+                transforms.Lambda(lambda x: (x - 0.5)*2.0),
+                transforms.Lambda(lambda x: x.flatten())]
+            )
+        else:
+            transform=transforms.Compose([
+                transforms.ToTensor(), 
+                transforms.Lambda(lambda x: x.squeeze())
+            ])
+
         train_data = datasets.MNIST('data/',
             train=True,
             download=True,
@@ -241,14 +250,18 @@ if __name__ == "__main__":
                 q = vae_model.encoder(x)
                 z = q.rsample()  # sample from approximate posterior
                 latent_vectors.append(z.cpu())
+
         latent_vectors = torch.cat(latent_vectors, dim=0)
+
+        print(latent_vectors.mean(0))
+        print(latent_vectors.std(0))
+
         train_loader = torch.utils.data.DataLoader(latent_vectors, batch_size=args.batch_size, shuffle=True)
 
         D = args.latent_dim
     
 
     # Define the network
-    print(args.network)
     if args.network == "fcn":
         num_hidden = 64
         network = FcNetwork(D, num_hidden)
@@ -309,11 +322,20 @@ if __name__ == "__main__":
             if args.vae_model is None:
                 # Load the model
                 model.load_state_dict(torch.load(args.model, map_location=torch.device(args.device)))
+                model.eval()
+
+                N = 10000
+
+                # Start timing
+                start_time = time.time()
+
+                # If using CUDA, synchronize first
+                if args.device == 'cuda':
+                    torch.cuda.synchronize()
 
                 # Generate samples in flattened space
-                model.eval()
                 with torch.no_grad():
-                    samples = model.sample((100, D)).cpu()
+                    samples = model.sample((N, D)).cpu()
 
                 # Map from [-1,1] back to [0,1]
                 samples = samples / 2 + 0.5
@@ -322,24 +344,48 @@ if __name__ == "__main__":
                 # Reshape to MNIST image shape
                 samples = samples.view(-1, 1, 28, 28)
 
+                if args.device == 'cuda':
+                    torch.cuda.synchronize()
+
+                # End timing
+                end_time = time.time()
+
+                print(f"Sampling {N} images took {end_time - start_time:.4f} seconds")
+
                 # Save grid of generated digits
-                save_image(samples, args.samples, nrow=10)
+                torch.save(samples, args.samples_data)
+                save_image(samples[:100], args.samples, nrow=10)
 
             else:
                 # Load the DDPM model trained on latent space
                 model.load_state_dict(torch.load(args.model, map_location=torch.device(args.device)))
                 model.eval()
 
+                N = 10000
+
+                # Start timing
+                start_time = time.time()
+
+                # If using CUDA, synchronize first
+                if args.device == 'cuda':
+                    torch.cuda.synchronize()
+
                 # Sample latent vectors
                 with torch.no_grad():
-                    z_samples = model.sample((100, args.latent_dim)).to(args.device)
+                    z_samples = model.sample((N, args.latent_dim)).to(args.device)
+                    samples = vae_model.decoder(z_samples).mean.cpu()
 
-                # Decode latent vectors to images
-                with torch.no_grad():
-                    recon = vae_model.decoder(z_samples).sample().cpu()
+                # Reshape to MNIST image shape
+                samples = samples.view(-1, 1, 28, 28)
 
-                # If decoder outputs [0,1] directly, good. Otherwise, map appropriately
-                recon = torch.clamp(recon, 0.0, 1.0).view(-1, 1, 28, 28)
+                if args.device == 'cuda':
+                    torch.cuda.synchronize()
+
+                # End timing
+                end_time = time.time()
+
+                print(f"Sampling {N} images took {end_time - start_time:.4f} seconds")
 
                 # Save generated images
-                save_image(recon, args.samples, nrow=10)
+                torch.save(samples, args.samples_data)
+                save_image(samples[:100], args.samples, nrow=10)
